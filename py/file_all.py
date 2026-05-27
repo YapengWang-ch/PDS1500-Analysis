@@ -9,11 +9,11 @@ file_all.py — PDS1500 数据分析 (Python 版)
   2. 按 8 板 × 8 通道分离数据
   3. 提取触发阈值、时间戳、触发计数
   4. 提取波形数据 (每通道 1000 个采样点)
-  5. 分析 Channel 1 和 Channel 7 的最小值
+  5. 分析指定通道的最小值 (通过 config.txt 配置)
   6. 输出直方图和波形图 (PNG)
 
 用法:
-  python file_all.py <input.bin> [output_dir]
+  python file_all.py <input.bin> [-c config.txt] [-o output_dir]
 
 依赖:
   numpy, matplotlib
@@ -22,207 +22,219 @@ file_all.py — PDS1500 数据分析 (Python 版)
 import sys
 import os
 import time
+import argparse
 import numpy as np
 import matplotlib
 matplotlib.use('Agg')  # 无 GUI 后端, 直接输出 PNG
 import matplotlib.pyplot as plt
 from pathlib import Path
 
+# 数据读取模块
+from pds1500_reader import (
+    BOARD_NUM,
+    CHANNEL_NUM,
+    SAMPLES_PER_BOARD,
+    WAVEFORM_LEN,
+    read_binary,
+    separate_boards,
+    extract_trigger_threshold,
+    extract_timestamps,
+    extract_triggers,
+    extract_waveform,
+    load_pds1500_file,
+)
+
 
 # ============================================================
-# 常量
+# 默认配置
 # ============================================================
-BOARD_NUM = 8
-CHANNEL_NUM = 8
-SAMPLES_PER_BOARD = 8192
-WAVEFORM_LEN = 1000
+DEFAULT_CONFIG = {
+    'analysis_channels': 'B1C1, B1C7',
+    'all_threshold': 14900,
+    'event_threshold': 14820,
+    'output_dir': './output',
+    'output_dpi': 150,
+    'histograms_enabled': True,
+    'histograms_bins': 400,
+    'waveform_overlay_enabled': True,
+    'waveform_overlay_max_events': 200,
+    'single_event_waveforms_enabled': True,
+    'single_event_waveforms_max_events': 50,
+    'trigger_rate_plot_enabled': True,
+    'max_events': 0,
+    'pretrigger_samples': 20,
+    'waveform_length': 1000,
+}
 
 
-def read_binary(filename):
-    """读取 uint16 little-endian 二进制文件"""
-    data = np.fromfile(filename, dtype=np.uint16)
-    print(f"Read {len(data)} samples from {filename}")
-    return data
+# ============================================================
+# TXT 配置文件解析
+# ============================================================
+
+def _parse_bool(val):
+    """将字符串解析为 bool"""
+    return val.strip().lower() in ('true', 'yes', '1', 'on')
 
 
-def separate_boards(data):
+def _parse_int(val):
+    """将字符串解析为 int"""
+    return int(val.strip())
+
+
+def _parse_channels(val):
+    """解析通道列表: 'B1C1, B1C7, B2C3' -> [(0,0,'B1C1'), (0,6,'B1C7'), (1,2,'B2C3')]"""
+    channels = []
+    for item in val.split(','):
+        item = item.strip()
+        if not item:
+            continue
+        item_upper = item.upper()
+        if item_upper.startswith('B') and 'C' in item_upper:
+            try:
+                b_part = item_upper[1:item_upper.index('C')]
+                c_part = item_upper[item_upper.index('C') + 1:]
+                board = int(b_part)
+                channel = int(c_part)
+                label = f"B{board}C{channel}"
+                channels.append((board - 1, channel - 1, label))
+            except ValueError:
+                print(f"Warning: cannot parse channel '{item}', skipping")
+    return channels
+
+
+# 配置项解析器映射
+_CONFIG_PARSERS = {
+    'analysis_channels':              _parse_channels,
+    'all_threshold':                  _parse_int,
+    'event_threshold':                _parse_int,
+    'output_dir':                    str.strip,
+    'output_dpi':                    _parse_int,
+    'histograms_enabled':            _parse_bool,
+    'histograms_bins':               _parse_int,
+    'waveform_overlay_enabled':      _parse_bool,
+    'waveform_overlay_max_events':   _parse_int,
+    'single_event_waveforms_enabled': _parse_bool,
+    'single_event_waveforms_max_events': _parse_int,
+    'trigger_rate_plot_enabled':     _parse_bool,
+    'max_events':                    _parse_int,
+    'pretrigger_samples':            _parse_int,
+    'waveform_length':               _parse_int,
+}
+
+
+def load_txt_config(config_path=None):
     """
-    按板子分离数据.
-    每个事件 = 65536 samples = 8 boards × 8192 samples/board.
-    返回: list of 8 arrays, 每个 shape = (event_size * 8192,)
+    加载 TXT 配置文件.
+    优先级: 指定路径 > 脚本同目录 config.txt > 默认配置
+
+    文件格式:
+      key = value
+      # 注释
     """
-    data_end = len(data)
-    data_size = data_end // CHANNEL_NUM          # 每个板子的总数据量
-    event_size = data_size // SAMPLES_PER_BOARD   # 事件数
-    print(f"data_size={data_size}, event_size={event_size}")
+    if config_path and os.path.isfile(config_path):
+        pass
+    else:
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        default_path = os.path.join(script_dir, 'config.txt')
+        if os.path.isfile(default_path):
+            config_path = default_path
 
-    # 将原始数据 reshape 为 (event_size, 65536)
-    total_per_event = BOARD_NUM * SAMPLES_PER_BOARD  # 65536
-    usable = event_size * total_per_event
-    data_trimmed = data[:usable].reshape(event_size, total_per_event)
+    if config_path and os.path.isfile(config_path):
+        print(f"Loading config from: {config_path}")
+        cfg = DEFAULT_CONFIG.copy()
+        with open(config_path, 'r') as f:
+            for lineno, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith('#'):
+                    continue
+                if '=' not in line:
+                    continue
+                key, _, val = line.partition('=')
+                key = key.strip()
+                val = val.strip()
+                if key in _CONFIG_PARSERS:
+                    try:
+                        cfg[key] = _CONFIG_PARSERS[key](val)
+                    except Exception as e:
+                        print(f"Warning: config line {lineno}: {e}")
+                else:
+                    print(f"Warning: unknown config key '{key}' at line {lineno}")
+        return cfg
+    else:
+        print("No config file found, using default configuration.")
+        return DEFAULT_CONFIG.copy()
 
-    # 拆分为 8 个板子: 每个 shape = (event_size, 8192)
-    board_data = []
-    for b in range(BOARD_NUM):
-        bd = data_trimmed[:, b * SAMPLES_PER_BOARD : (b + 1) * SAMPLES_PER_BOARD]
-        board_data.append(bd)
 
-    print("Board separation complete.")
-    return board_data, event_size
-
-
-def extract_trigger_threshold(board_data):
+def parse_channels(cfg):
     """
-    提取触发阈值: 每个 channel 的第 1017 个 sample (1-indexed → index 1016)
-    返回: (8, 8) ndarray
+    从配置中解析通道列表.
+    返回: list of (board_index_0based, channel_index_0based, label)
     """
-    trigger_threshold = np.zeros((BOARD_NUM, CHANNEL_NUM), dtype=np.uint16)
-    for b in range(BOARD_NUM):
-        for c in range(CHANNEL_NUM):
-            # MATLAB: 1024*(i-1)+1017 → Python: 1024*c + 1016
-            trigger_threshold[b, c] = board_data[b][0, 1024 * c + 1016]
-    print("Trigger thresholds extracted.")
-    return trigger_threshold
+    val = cfg.get('analysis_channels', '')
+    if isinstance(val, list):
+        return val
+    elif isinstance(val, str):
+        return _parse_channels(val)
+    return []
 
 
-def extract_timestamps(board_data, event_size):
+def analyze_channels(data_all, event_size, channels, cfg):
     """
-    提取时间戳.
-    MATLAB: v0*16^0 + v1*16^4 + v2*16^8 + v3*16^12
-    即: v0 + v1*65536 + v2*65536^2 + v3*65536^3
-    返回: (event_size, 64) ndarray
+    分析指定通道的最小值.
+    
+    参数:
+      data_all:   (event_size, 8, 8, 1000) ndarray
+      event_size: 事件数
+      channels:   list of (board_idx, channel_idx, label)
+      cfg:        配置字典
+    
+    返回:
+      results: dict, 每个通道的分析结果
     """
-    time_num = np.zeros((event_size, 64), dtype=np.uint64)
+    all_threshold = cfg['all_threshold']
+    event_threshold = cfg['event_threshold']
+    max_events = cfg.get('max_events', 0)
+    n_events = event_size if max_events <= 0 else min(event_size, max_events)
 
-    for c in range(CHANNEL_NUM):
-        base = 1024 * c
-        # MATLAB 1-indexed: 1009,1010,1011,1012 → Python: 1008,1009,1010,1011
-        t0, t1, t2, t3 = base + 1008, base + 1009, base + 1010, base + 1011
+    results = {}
 
-        for b in range(BOARD_NUM):
-            col = b * 8 + c
-            v0 = board_data[b][:, t0].astype(np.uint64)
-            v1 = board_data[b][:, t1].astype(np.uint64)
-            v2 = board_data[b][:, t2].astype(np.uint64)
-            v3 = board_data[b][:, t3].astype(np.uint64)
-            time_num[:, col] = v0 + v1 * 65536 + v2 * 4294967296 + v3 * 281474976710656
+    for board_idx, ch_idx, label in channels:
+        all_min_voltages = []
+        all_min_indices = []
+        event_voltages = []
+        event_indices = []
+        event_count = 0
 
-    print("Timestamps extracted.")
-    return time_num
+        for ev in range(n_events):
+            waveform = data_all[ev, board_idx, ch_idx, :]
+            min_idx = int(np.argmin(waveform))
+            min_val = waveform[min_idx]
 
+            if min_val < all_threshold:
+                all_min_voltages.append(min_val)
+                all_min_indices.append(min_idx)
+            if min_val < event_threshold:
+                event_count += 1
+                event_voltages.append(min_val)
+                event_indices.append(min_idx)
 
-def extract_triggers(board_data, event_size):
-    """
-    提取触发计数.
-    返回: (event_size, 64) ndarray
-    """
-    trig_num = np.zeros((event_size, 64), dtype=np.uint64)
+            if (ev + 1) % 100 == 0:
+                print(f"  [{label}] Processed event {ev + 1}/{n_events}")
 
-    for c in range(CHANNEL_NUM):
-        base = 1024 * c
-        # MATLAB 1-indexed: 1013,1014,1015,1016 → Python: 1012,1013,1014,1015
-        t0, t1, t2, t3 = base + 1012, base + 1013, base + 1014, base + 1015
+        results[label] = {
+            'all_min_voltages': np.array(all_min_voltages, dtype=np.uint16),
+            'all_min_indices':  np.array(all_min_indices, dtype=np.uint16),
+            'event_voltages':   np.array(event_voltages, dtype=np.uint16),
+            'event_indices':    np.array(event_indices, dtype=np.uint16),
+            'event_count':      event_count,
+            'all_count':        len(all_min_voltages),
+            'board_idx':        board_idx,
+            'channel_idx':      ch_idx,
+        }
 
-        for b in range(BOARD_NUM):
-            col = b * 8 + c
-            v0 = board_data[b][:, t0].astype(np.uint64)
-            v1 = board_data[b][:, t1].astype(np.uint64)
-            v2 = board_data[b][:, t2].astype(np.uint64)
-            v3 = board_data[b][:, t3].astype(np.uint64)
-            trig_num[:, col] = v0 + v1 * 65536 + v2 * 4294967296 + v3 * 281474976710656
-
-    print("Trigger counts extracted.")
-    return trig_num
-
-
-def extract_waveform(board_data, event_size):
-    """
-    提取波形数据.
-    data_all[event, board, channel, :1000]
-    MATLAB: 1024*(i-1)+9 : 1024*(i-1)+1008 → Python: 1024*c+8 : 1024*c+1008
-    返回: (event_size, 8, 8, 1000) ndarray
-    """
-    data_all = np.zeros((event_size, BOARD_NUM, CHANNEL_NUM, WAVEFORM_LEN), dtype=np.uint16)
-
-    for b in range(BOARD_NUM):
-        for c in range(CHANNEL_NUM):
-            base = 1024 * c
-            start = base + 8       # MATLAB +9 (1-indexed)
-            end = base + 1008      # MATLAB +1008 inclusive → Python :1008 exclusive
-            data_all[:, b, c, :] = board_data[b][:, start:end]
-
-    print("Waveform data extracted.")
-    return data_all
-
-
-def analyze_channels(data_all, event_size):
-    """
-    分析 Channel 1 和 Channel 7 的最小值.
-    返回两组结果:
-      - all_*:  min_voltage < 14900
-      - event_*: min_voltage < 14820
-    """
-    all_min_voltages_ch1 = []
-    all_min_indices_ch1 = []
-    all_min_voltages_ch7 = []
-    all_min_indices_ch7 = []
-
-    event_voltages_ch1 = []
-    event_indices_ch1 = []
-    event_voltages_ch7 = []
-    event_indices_ch7 = []
-
-    event_ch1 = 0
-    event_ch7 = 0
-
-    board_id = 0  # 只分析 board 1
-
-    for ev in range(event_size):
-        # Channel 1 (index 0)
-        waveform = data_all[ev, board_id, 0, :]
-        min_idx = int(np.argmin(waveform))
-        min_val = waveform[min_idx]
-
-        if min_val < 14900:
-            all_min_voltages_ch1.append(min_val)
-            all_min_indices_ch1.append(min_idx)
-        if min_val < 14820:
-            event_ch1 += 1
-            event_voltages_ch1.append(min_val)
-            event_indices_ch1.append(min_idx)
-
-        # Channel 7 (index 6)
-        waveform = data_all[ev, board_id, 6, :]
-        min_idx = int(np.argmin(waveform))
-        min_val = waveform[min_idx]
-
-        if min_val < 14900:
-            all_min_voltages_ch7.append(min_val)
-            all_min_indices_ch7.append(min_idx)
-        if min_val < 14820:
-            event_ch7 += 1
-            event_voltages_ch7.append(min_val)
-            event_indices_ch7.append(min_idx)
-
-        if (ev + 1) % 100 == 0:
-            print(f"  Processed event {ev + 1}/{event_size}")
+        print(f"  [{label}] all={len(all_min_voltages)}, events={event_count}")
 
     print("Analysis complete.")
-    print(f"  CH1: all={len(all_min_voltages_ch1)}, events={event_ch1}")
-    print(f"  CH7: all={len(all_min_voltages_ch7)}, events={event_ch7}")
-
-    results = {
-        'all_min_voltages_ch1': np.array(all_min_voltages_ch1, dtype=np.uint16),
-        'all_min_indices_ch1':  np.array(all_min_indices_ch1, dtype=np.uint16),
-        'all_min_voltages_ch7': np.array(all_min_voltages_ch7, dtype=np.uint16),
-        'all_min_indices_ch7':  np.array(all_min_indices_ch7, dtype=np.uint16),
-        'event_voltages_ch1':   np.array(event_voltages_ch1, dtype=np.uint16),
-        'event_indices_ch1':    np.array(event_indices_ch1, dtype=np.uint16),
-        'event_voltages_ch7':   np.array(event_voltages_ch7, dtype=np.uint16),
-        'event_indices_ch7':    np.array(event_indices_ch7, dtype=np.uint16),
-        'event_ch1': event_ch1,
-        'event_ch7': event_ch7,
-    }
     return results
 
 
@@ -273,7 +285,7 @@ def compute_trigger_rate(time_num, trig_num, event_size):
     return rate_info
 
 
-def plot_trigger_rate(rate_info, output_dir):
+def plot_trigger_rate(rate_info, output_dir, dpi=150):
     """
     绘制触发率相关图表:
       - 每通道触发计数分布
@@ -297,103 +309,136 @@ def plot_trigger_rate(rate_info, output_dir):
 
     plt.tight_layout()
     outpath = os.path.join(output_dir, 'figure_trigger_rate.png')
-    fig.savefig(outpath, dpi=150)
+    fig.savefig(outpath, dpi=dpi)
     plt.close(fig)
     print(f"Saved {outpath}")
 
-def plot_histograms(results, output_dir):
+def plot_histograms(results, cfg, output_dir):
     """
-    对应 MATLAB figure(2): 8 个子图的直方图
+    绘制直方图.
+    每个通道 4 张子图: all_voltages, all_indices, event_voltages, event_indices
+    动态布局: n_channels 行 x 4 列
     """
-    fig, axes = plt.subplots(2, 4, figsize=(16, 10))
+    channels = list(results.keys())  # 保持顺序
+    n_channels = len(channels)
 
-    data_pairs = [
-        (results['all_min_voltages_ch1'], 'Channel 1 Min Voltages (all <14900)', 'Voltage', axes[0, 0]),
-        (results['all_min_indices_ch1'],  'Channel 1 Min Indices (all <14900)',  'Index',   axes[0, 1]),
-        (results['all_min_voltages_ch7'], 'Channel 7 Min Voltages (all <14900)', 'Voltage', axes[0, 2]),
-        (results['all_min_indices_ch7'],  'Channel 7 Min Indices (all <14900)',  'Index',   axes[0, 3]),
-        (results['event_voltages_ch1'],   'Channel 1 Min Voltages (event <14820)', 'Voltage', axes[1, 0]),
-        (results['event_indices_ch1'],    'Channel 1 Min Indices (event <14820)',  'Index',   axes[1, 1]),
-        (results['event_voltages_ch7'],   'Channel 7 Min Voltages (event <14820)', 'Voltage', axes[1, 2]),
-        (results['event_indices_ch7'],    'Channel 7 Min Indices (event <14820)',  'Index',   axes[1, 3]),
-    ]
+    if n_channels == 0:
+        print("No channels to plot histograms for.")
+        return
 
-    for data, title, xlabel, ax in data_pairs:
-        if len(data) > 0:
-            ax.hist(data, bins=400)
-            ax.set_yscale('log')
-        ax.set_title(title)
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel('Frequency')
+    bins = cfg.get('histograms_bins', 400)
+    dpi = cfg.get('output_dpi', 150)
+
+    fig, axes = plt.subplots(n_channels, 4, figsize=(20, 5 * n_channels))
+    if n_channels == 1:
+        axes = axes.reshape(1, -1)
+
+    for row, label in enumerate(channels):
+        r = results[label]
+        data_pairs = [
+            (r['all_min_voltages'], f'{label} Min Voltages (all <{cfg["all_threshold"]})', 'Voltage'),
+            (r['all_min_indices'],  f'{label} Min Indices (all <{cfg["all_threshold"]})',  'Index'),
+            (r['event_voltages'],   f'{label} Min Voltages (event <{cfg["event_threshold"]})', 'Voltage'),
+            (r['event_indices'],    f'{label} Min Indices (event <{cfg["event_threshold"]})',  'Index'),
+        ]
+        for col, (data, title, xlabel) in enumerate(data_pairs):
+            ax = axes[row, col]
+            if len(data) > 0:
+                ax.hist(data, bins=bins)
+                ax.set_yscale('log')
+            ax.set_title(title)
+            ax.set_xlabel(xlabel)
+            ax.set_ylabel('Frequency')
 
     plt.tight_layout()
-    outpath = os.path.join(output_dir, 'figure2_histograms.png')
-    fig.savefig(outpath, dpi=150)
+    outpath = os.path.join(output_dir, 'figure_histograms.png')
+    fig.savefig(outpath, dpi=dpi)
     plt.close(fig)
     print(f"Saved {outpath}")
 
 
-def plot_waveforms(data_all, trigger_threshold, event_size, output_dir):
+def plot_waveforms(data_all, trigger_threshold, event_size, channels, cfg, output_dir):
     """
-    对应 MATLAB figure(3): 前 200 个事件的 Ch1/Ch7 波形图
+    波形叠加图: 每个通道一个子图, 叠加前 N 个事件的波形
     """
-    n_events = min(event_size, 200)
-    board_id = 0
+    max_events = min(event_size, cfg.get('waveform_overlay_max_events', 200))
+    n_channels = len(channels)
+    dpi = cfg.get('output_dpi', 150)
 
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    if n_channels == 0:
+        return
 
-    for ev in range(n_events):
-        # Channel 1
-        wf1 = data_all[ev, board_id, 0, :]
-        axes[0].plot(wf1, linewidth=0.5, alpha=0.5)
-        # Channel 7
-        wf7 = data_all[ev, board_id, 6, :]
-        axes[1].plot(wf7, linewidth=0.5, alpha=0.5)
+    n_cols = min(n_channels, 4)
+    n_rows = (n_channels + n_cols - 1) // n_cols
 
-    # 画触发阈值线
-    for ax, ch in zip(axes, [0, 6]):
-        ax.axhline(y=trigger_threshold[board_id, ch], color='r', linestyle='--',
-                   label=f'Threshold={trigger_threshold[board_id, ch]}')
-        ax.set_title(f'Board 1, Channel {ch + 1}')
+    fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+    if n_channels == 1:
+        axes = np.array([axes])
+    axes = axes.flatten()
+
+    for idx, (board_idx, ch_idx, label) in enumerate(channels):
+        ax = axes[idx]
+        for ev in range(max_events):
+            wf = data_all[ev, board_idx, ch_idx, :]
+            ax.plot(wf, linewidth=0.5, alpha=0.5)
+        ax.axhline(y=trigger_threshold[board_idx, ch_idx], color='r', linestyle='--',
+                   label=f'Threshold={trigger_threshold[board_idx, ch_idx]}')
+        ax.set_title(f'Board {board_idx + 1}, Channel {ch_idx + 1} ({label})')
         ax.set_xlabel('Sample')
         ax.set_ylabel('ADC Value')
         ax.legend()
 
+    for idx in range(n_channels, len(axes)):
+        axes[idx].set_visible(False)
+
     plt.tight_layout()
-    outpath = os.path.join(output_dir, 'figure3_waveforms.png')
-    fig.savefig(outpath, dpi=150)
+    outpath = os.path.join(output_dir, 'figure_waveforms_overlay.png')
+    fig.savefig(outpath, dpi=dpi)
     plt.close(fig)
     print(f"Saved {outpath}")
 
 
-def plot_single_event_waveforms(data_all, trigger_threshold, event_size, output_dir):
+def plot_single_event_waveforms(data_all, trigger_threshold, event_size, channels, cfg, output_dir):
     """
-    对应 MATLAB parfor 内的 subplot(2,2,1) 和 subplot(2,2,2):
-    逐个事件绘制 Ch1/Ch7 波形 (只保存前 50 个事件, 避免过多文件)
+    逐个事件绘制波形: 每个事件一张图, 每个通道一个子图
     """
-    n_save = min(event_size, 50)
-    board_id = 0
+    max_events = min(event_size, cfg.get('single_event_waveforms_max_events', 50))
+    n_channels = len(channels)
+    dpi = cfg.get('output_dpi', 150)
 
-    for ev in range(n_save):
-        fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    if n_channels == 0:
+        return
 
-        for ax, ch in zip(axes, [0, 6]):
-            wf = data_all[ev, board_id, ch, :]
+    n_cols = min(n_channels, 4)
+    n_rows = (n_channels + n_cols - 1) // n_cols
+
+    for ev in range(max_events):
+        fig, axes = plt.subplots(n_rows, n_cols, figsize=(5 * n_cols, 4 * n_rows))
+        if n_channels == 1:
+            axes = np.array([axes])
+        axes = axes.flatten()
+
+        for idx, (board_idx, ch_idx, label) in enumerate(channels):
+            ax = axes[idx]
+            wf = data_all[ev, board_idx, ch_idx, :]
             ax.plot(wf)
-            ax.axhline(y=trigger_threshold[board_id, ch], color='r', linestyle='--')
-            ax.set_title(f'Event {ev}, Board 1, Channel {ch + 1}')
+            ax.axhline(y=trigger_threshold[board_idx, ch_idx], color='r', linestyle='--')
+            ax.set_title(f'Event {ev}, {label}')
             ax.set_xlabel('Sample')
             ax.set_ylabel('ADC Value')
 
+        for idx in range(n_channels, len(axes)):
+            axes[idx].set_visible(False)
+
         plt.tight_layout()
         outpath = os.path.join(output_dir, f'event_{ev:04d}_waveforms.png')
-        fig.savefig(outpath, dpi=100)
+        fig.savefig(outpath, dpi=dpi)
         plt.close(fig)
 
         if (ev + 1) % 10 == 0:
-            print(f"  Saved {ev + 1}/{n_save} event waveform plots")
+            print(f"  Saved {ev + 1}/{max_events} event waveform plots")
 
-    print(f"Saved {n_save} event waveform plots to {output_dir}/")
+    print(f"Saved {max_events} event waveform plots to {output_dir}/")
 
 
 # ============================================================
@@ -401,101 +446,119 @@ def plot_single_event_waveforms(data_all, trigger_threshold, event_size, output_
 # ============================================================
 
 def main():
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <input.bin> [output_dir]")
-        print("  input.bin  - PDS1500 binary data file (uint16 LE)")
-        print("  output_dir - output directory (default: ./output)")
+    parser = argparse.ArgumentParser(
+        description='PDS1500 Analysis - Python version',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python file_all.py data.bin
+  python file_all.py data.bin -c my_config.txt
+  python file_all.py data.bin -c config.txt -o ./results
+        """
+    )
+    parser.add_argument('input', help='PDS1500 binary data file (uint16 LE)')
+    parser.add_argument('-c', '--config', default=None, help='Configuration file (default: config.txt)')
+    parser.add_argument('-o', '--output', default=None, help='Output directory (overrides config)')
+    args = parser.parse_args()
+
+    # ---- 加载配置 ----
+    cfg = load_txt_config(args.config)
+
+    # 解析通道
+    channels = parse_channels(cfg)
+    if not channels:
+        print("Error: no analysis channels specified in config.")
+        print("  Add 'analysis_channels = B1C1, B1C7' to config.txt")
         sys.exit(1)
 
-    input_file = sys.argv[1]
-    output_dir = sys.argv[2] if len(sys.argv) >= 3 else './output'
+    print("Configured channels:")
+    for _, _, label in channels:
+        print(f"  - {label}")
 
+    # 输出目录: 命令行 > 配置文件 > 默认
+    output_dir = args.output or cfg.get('output_dir', './output')
     os.makedirs(output_dir, exist_ok=True)
 
     print("=" * 50)
     print("  PDS1500 Analysis (Python version)")
-    print(f"  Input:  {input_file}")
+    print(f"  Input:  {args.input}")
     print(f"  Output: {output_dir}")
     print("=" * 50)
 
     t_start = time.time()
 
     # ---- 步骤 1: 读取二进制文件 ----
-    print("\n[1/8] Reading binary file...")
-    data = read_binary(input_file)
+    print("\n[1/7] Reading binary file...")
+    data = read_binary(args.input)
 
     # ---- 步骤 2: 按板子分离 ----
-    print("[2/8] Separating boards...")
+    print("[2/7] Separating boards...")
     board_data, event_size = separate_boards(data)
-    del data  # 释放原始数据内存
+    del data
 
     # ---- 步骤 3: 提取触发阈值 ----
-    print("[3/8] Extracting trigger thresholds...")
+    print("[3/7] Extracting trigger thresholds...")
     trigger_threshold = extract_trigger_threshold(board_data)
 
-    # ---- 步骤 4: 提取时间戳 ----
-    print("[4/8] Extracting timestamps...")
+    # ---- 步骤 4: 提取时间戳 & 触发计数 ----
+    print("[4/7] Extracting timestamps and trigger counts...")
     time_num = extract_timestamps(board_data, event_size)
-
-    # ---- 步骤 5: 提取触发计数 ----
-    print("[5/8] Extracting trigger counts...")
     trig_num = extract_triggers(board_data, event_size)
 
-    # ---- 步骤 6: 计算触发率 ----
-    print("[6/8] Computing trigger rates...")
+    # ---- 步骤 5: 计算触发率 ----
+    print("[5/7] Computing trigger rates...")
     rate_info = compute_trigger_rate(time_num, trig_num, event_size)
 
-    # ---- 步骤 7: 提取波形数据 ----
-    print("[7/8] Extracting waveform data...")
+    # ---- 步骤 6: 提取波形数据 ----
+    print("[6/7] Extracting waveform data...")
     data_all = extract_waveform(board_data, event_size)
-
-    # 释放 board_data (后续只需要 data_all)
     del board_data
 
-    # ---- 步骤 8: 分析 Channel 1 & 7 ----
-    print("[8/8] Analyzing channels...")
-    results = analyze_channels(data_all, event_size)
+    # ---- 步骤 7: 分析通道 ----
+    print("[7/7] Analyzing channels...")
+    results = analyze_channels(data_all, event_size, channels, cfg)
 
     # ---- 绘图 ----
     print("\nGenerating plots...")
 
-    print("  Plotting histograms (Figure 2)...")
-    plot_histograms(results, output_dir)
+    if cfg.get('histograms_enabled', True):
+        print("  Plotting histograms...")
+        plot_histograms(results, cfg, output_dir)
 
-    print("  Plotting waveform overlay (Figure 3)...")
-    plot_waveforms(data_all, trigger_threshold, event_size, output_dir)
+    if cfg.get('waveform_overlay_enabled', True):
+        print("  Plotting waveform overlay...")
+        plot_waveforms(data_all, trigger_threshold, event_size, channels, cfg, output_dir)
 
-    print("  Plotting individual event waveforms...")
-    plot_single_event_waveforms(data_all, trigger_threshold, event_size, output_dir)
+    if cfg.get('single_event_waveforms_enabled', True):
+        print("  Plotting individual event waveforms...")
+        plot_single_event_waveforms(data_all, trigger_threshold, event_size, channels, cfg, output_dir)
 
-    print("  Plotting trigger rate...")
-    plot_trigger_rate(rate_info, output_dir)
+    if cfg.get('trigger_rate_plot_enabled', True):
+        print("  Plotting trigger rate...")
+        plot_trigger_rate(rate_info, output_dir, cfg.get('output_dpi', 150))
 
     # ---- 汇总 ----
     t_end = time.time()
-
-    trigger_threshold_1_ch1 = 14820
-    trigger_threshold_1_ch7 = 14820
-
-    rate_ch1 = results['event_ch1'] / event_size
-    rate_ch7 = results['event_ch7'] / event_size
 
     print("\n" + "=" * 50)
     print("  Summary")
     print("=" * 50)
     print(f"  Total events:              {event_size}")
-    print(f"  CH1 trigger threshold:     {trigger_threshold_1_ch1}")
-    print(f"  CH7 trigger threshold:     {trigger_threshold_1_ch7}")
-    print(f"  CH1 events (<14820):       {results['event_ch1']}, rate={rate_ch1:.6f}")
-    print(f"  CH7 events (<14820):       {results['event_ch7']}, rate={rate_ch7:.6f}")
-    print(f"  CH1 all (<14900):          {len(results['all_min_voltages_ch1'])}")
-    print(f"  CH7 all (<14900):          {len(results['all_min_voltages_ch7'])}")
+    print(f"  Thresholds:                all={cfg['all_threshold']}, event={cfg['event_threshold']}")
+    for label in results:
+        r = results[label]
+        rate = r['event_count'] / event_size
+        print(f"  {label}: events(<{cfg['event_threshold']})={r['event_count']}, "
+              f"rate={rate:.6f}, all(<{cfg['all_threshold']})={r['all_count']}")
     print(f"  --- Trigger Rate ---")
-    print(f"  System trigger rate:       {rate_info['trigger_rate_hz']:.2f} Hz ({rate_info['trigger_rate_khz']:.3f} kHz)")
+    print(f"  System trigger rate:       {rate_info['trigger_rate_hz']:.2f} Hz "
+          f"({rate_info['trigger_rate_khz']:.3f} kHz)")
     print(f"  Time error (sum time_diff): {rate_info['time_err']}")
-    print(f"  Trig error1 (sum per ch):  [{np.min(rate_info['trig_err1'])}, {np.max(rate_info['trig_err1'])}]")
+    print(f"  Trig error1 range:         [{np.min(rate_info['trig_err1'])}, {np.max(rate_info['trig_err1'])}]")
     print(f"  Trig error2 (total sum):   {rate_info['trig_err2']}")
     print(f"  Elapsed time:              {t_end - t_start:.2f} seconds")
+    print(f"\n  Output saved to: {output_dir}/")
+    print("Done.")
     print(f"\n  Output saved to: {output_dir}/")
     print("Done.")
 

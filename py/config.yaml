@@ -1,0 +1,78 @@
+# ============================================================
+# PDS1500 Analysis 配置文件
+# ============================================================
+# 用法:
+#   python file_all.py <input.bin> [-c config.yaml] [-o output_dir]
+# ============================================================
+
+# ---- 分析通道配置 ----
+# 指定要分析的通道列表
+# 格式: [板子编号, 通道编号]  (1-indexed, 与 MATLAB 一致)
+# board: 1-8, channel: 1-8
+analysis_channels:
+  - board: 1
+    channel: 1
+  - board: 1
+    channel: 7
+
+# ---- 阈值配置 ----
+thresholds:
+  # 宽松阈值: 记录所有低于此值的最小值
+  all_threshold: 14900
+  # 严格阈值: 低于此值计为"事件"
+  event_threshold: 14820
+  # 触发电平覆盖 (可选, 留空则从数据中自动提取)
+  # trigger_level_override:
+  #   - board: 1
+  #     channel: 1
+  #     value: 14820
+  #   - board: 1
+  #     channel: 7
+  #     value: 14820
+
+# ---- 输入文件配置 ----
+input:
+  # 二进制文件字节序: little / big
+  byte_order: little
+  # 数据类型: uint16 (PDS1500 标准格式)
+  dtype: uint16
+
+# ---- 输出配置 ----
+output:
+  # 输出目录 (命令行 -o 参数优先)
+  dir: ./output
+  # 图像 DPI
+  dpi: 150
+  # 图像格式: png / pdf / svg
+  image_format: png
+
+# ---- 绘图配置 ----
+plots:
+  # 是否绘制直方图 (Figure 2)
+  histograms:
+    enabled: true
+    bins: 400
+    log_scale: true
+
+  # 是否绘制波形叠加图 (Figure 3)
+  waveform_overlay:
+    enabled: true
+    max_events: 200
+
+  # 是否绘制单个事件波形
+  single_event_waveforms:
+    enabled: true
+    max_events: 50
+
+  # 是否绘制触发率图
+  trigger_rate:
+    enabled: true
+
+# ---- 数据处理配置 ----
+processing:
+  # 预触发采样点数 (用于计算基线)
+  pretrigger_samples: 20
+  # 波形采样长度
+  waveform_length: 1000
+  # 最大处理事件数 (0 = 全部)
+  max_events: 0

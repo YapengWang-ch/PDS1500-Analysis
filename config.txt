@@ -1,0 +1,46 @@
+# PDS1500 Analysis 配置文件
+# 格式: 每行一个配置项
+#   # 开头为注释
+#   空行忽略
+#
+# 支持的配置项:
+#   analysis_channels = B1C1, B1C7, B2C3, ...
+#   all_threshold = 14900
+#   event_threshold = 14820
+#   output_dir = ./output
+#   output_dpi = 150
+#   histograms_enabled = true
+#   histograms_bins = 400
+#   waveform_overlay_enabled = true
+#   waveform_overlay_max_events = 200
+#   single_event_waveforms_enabled = true
+#   single_event_waveforms_max_events = 50
+#   trigger_rate_plot_enabled = true
+#   max_events = 0
+#   pretrigger_samples = 20
+#   waveform_length = 1000
+
+# ---- 分析通道: 格式 B<板号>C<通道号> ----
+analysis_channels = B1C1, B1C7
+
+# ---- 阈值 ----
+all_threshold = 14900
+event_threshold = 14820
+
+# ---- 输出 ----
+output_dir = ./output
+output_dpi = 150
+
+# ---- 绘图开关 ----
+histograms_enabled = true
+histograms_bins = 400
+waveform_overlay_enabled = true
+waveform_overlay_max_events = 200
+single_event_waveforms_enabled = true
+single_event_waveforms_max_events = 50
+trigger_rate_plot_enabled = true
+
+# ---- 处理选项 ----
+max_events = 0
+pretrigger_samples = 20
+waveform_length = 1000
